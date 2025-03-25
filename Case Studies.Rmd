@@ -1,0 +1,664 @@
+
+---
+title: "Multi-Omics Data Integration Using the R packages MOFA2 and iClusterPlus"
+author: "Lianbo Yu and Joseph McElroy"
+date: "2025-03-25"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+---
+
+
+## Introduction
+* This tutorial demonstrates how to use the R packages **MOFA2** and **iClusterPlus** to analyze multi-omics data. 
+* We will analyze a multi-omics dataset from the study: Dietrich *et al*. (2018) "Drug-perturbation-based stratification of blood cancer." *J Clin Invest* 128: 427-445. This dataset was featured in the first MOFA publication and is included in the MOFAdata R package. 
+
+## The multi-omics dataset
+The dataset being analyzed comprises four omics data types: drug response data, DNA methylation, RNA-seq, and somatic mutations, derived from blood samples of 200 patients with Chronic Lymphocytic Leukemia (CLL). Nearly 40% of the 200 samples were profiled with some but not all omics types. Sample metadata includes gender, age, time to next treatment (TTT), time to death (TTD), and binary indicators for whether a patient received treatment (treatedAfter) or passed away (died).
+
+The four omics data types in this dataset were processed as follows:
+
+* Somatic mutations (targeted and whole exome sequencing)
+  * Present in at least three samples (D=69)
+
+* RNA expression (RNA-Seq)
+  * Filter out low counts
+  * Normalize using the estimateSizeFactors and varianceStabilizingTransformation function of DESeq2
+  * Exclude genes from the Y chromosome
+  * Consider the top most variable mRNAs (D=5000)
+
+* DNA Methylation (Illumina arrays)
+  * Transform to M-values
+  * Extract top 1% most variable CpG sites excluding sex chromosomes (D=4248)
+
+* Drug response screens (ATP-based CellTiter-Glo assay)
+  * Keep 62 drug response measurements at five concentrations each (D=310)
+
+The data is structured as a list of matrices, with features in rows and samples in columns.
+
+```{r load_data, include=TRUE, message=FALSE, warning=FALSE}
+# Load libraries
+library(MOFA2)
+library(MOFAdata)
+library(iClusterPlus)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(lattice)
+library(pheatmap)
+library(RColorBrewer)
+library(gplots)
+library(survival)
+library(survminer)
+library(stats)
+library(graphics)
+
+# Load data
+utils::data("CLL_data")
+lapply(CLL_data, dim) 
+
+# Load sample metadata
+CLL_metadata <- fread("ftp://ftp.ebi.ac.uk/pub/databases/mofa/cll_vignette/sample_metadata.txt")
+```
+
+## Data integration using the R MOFA2 package
+
+### Model overview
+The MOFA model takes m data matrices as input ($Y^1$,. . ., $Y^m$), and decomposes these matrices into a matrix of factors ($Z$) for each sample and weight matrices, one for each
+data modality ($W^1$,.., $W^m$). White cells in the weight matrices correspond to zeros, i.e. inactive features, whereas the cross symbol in the data matrices denotes missing values.
+
+```{r model, echo=FALSE, out.width="600"}
+knitr::include_graphics("mofa.png")
+```
+
+### Create the MOFA object and train the MOFA model
+```{r Metadata, include=TRUE, message=FALSE, warning=FALSE}
+# Set seed for repeatability
+set.seed(1234)
+
+# Create the MOFA object
+MOFAobject <- create_mofa(CLL_data)
+MOFAobject
+
+# Data options
+data_opts <- get_default_data_options(MOFAobject)
+
+# Model options
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 15
+
+# Training options
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+train_opts$seed <- 42
+
+# Prepare the MOFA object
+MOFAobject <- prepare_mofa(MOFAobject, data_options = data_opts,
+                           model_options = model_opts, training_options = train_opts )
+
+# Train the MOFA model
+f <- "MOFAobject_CLL.rds"
+if (file.exists(f)) {
+    load(f)
+  } else {
+    MOFAobject <- run_mofa(MOFAobject, use_basilisk=TRUE)
+    save(MOFAobject,file=f)
+  }
+
+# Add sample metadata to the MOFA object
+samples_metadata(MOFAobject) <- CLL_metadata
+```
+
+### Data overview
+MOFA2 offers a data overview function to visualize key data set characteristics, including the number of views (rows), number of samples (columns), feature dimensions, and missing data (represented by grey bars).
+```{r overview, include=TRUE, message=FALSE, warning=FALSE}
+plot_data_overview(MOFAobject)
+```
+
+### Variability explained by factors
+```{r totalvariance, include=TRUE, message=FALSE, warning=FALSE}
+plot_variance_explained(MOFAobject, max_r2=15)
+```
+
+This plot illustrates the percentage of variability explained by each factor across different data views.
+
+* Factor 1 represents a source of variability present in all data views, suggesting its importance for the disease.
+* Factor 2 captures a strong source of variability that is exclusive to the drug response data.
+* Factor 3 and 5 account for variability observed across multiple data views.
+* Factor 4 and 6 contribute a strong source of variability specific to the mRNA data.
+
+```{r variance, include=TRUE, message=FALSE, warning=FALSE}
+plot_variance_explained(MOFAobject, plot_total = T)[[2]]
+```
+
+This plot illustrates the total variability explained by all factors. The explained variability depends on factors such as the number of samples and the number of factors. In this dataset, the MOFA model with 15 factors accounts for approximately 51% of the variability in drug response data and 43% in mRNA data. 
+
+### Correlation between factors
+```{r correlation, include=TRUE, message=FALSE, warning=FALSE}
+plot_factor_cor(MOFAobject)
+```
+
+This plot displays the correlations between factor scores, showing weak correlations among the 15 factors.
+
+### Explore weights 
+Features with no association with a given factor are expected to have weights close to zero, whereas features with strong association are expected to have large absolute weights. The sign of the weights indicates the direction of the effect: a positive weight suggests that the feature is more abundant in cells with positive factor values, whereas a negative weight indicates higher levels in cells with negative factor values.
+
+```{r f1weights, include=TRUE, message=FALSE, warning=FALSE}
+plot_top_weights(MOFAobject, view = "Mutations",
+                 factor = 1, nfeatures = 10, scale = T )
+```
+
+This plot displays the top 10 weights on Factor 1 for somatic mutation data, with IGHV having the highest positive weight on Factor 1.
+
+```{r f3weights, include=TRUE, message=FALSE, warning=FALSE}
+plot_top_weights(MOFAobject, view = "Mutations",
+                 factor = 3, nfeatures = 10, scale = T )
+```
+
+This plot presents the top 10 weights on Factor 3 for somatic mutation data, with trisomy 12 having the highest positive weight on Factor 3.
+
+### Explore factors
+```{r factor1, include=TRUE, message=FALSE, warning=FALSE}
+plot_factor(MOFAobject, factors = 1, color_by = "IGHV", 
+            add_violin = TRUE, dodge = TRUE )
+```
+
+This plot displays Factor 1 scores, with samples colored by IGHV mutation status. Samples with positive Factor 1 scores have the IGHV mutation, while those with negative Factor 1 scores do not.
+
+```{r factors, include=TRUE, message=FALSE, warning=FALSE}
+plot_factors(MOFAobject, factors = c(1,3), 
+             color_by = "IGHV", shape_by = "trisomy12",
+             dot_size = 2.5, show_missing = T ) + 
+             geom_hline(yintercept=1, linetype="dashed") +
+             geom_vline(xintercept=(-0.5), linetype="dashed")
+```
+
+This scatter plot displays Factor 1 versus Factor 3, with points colored by IGHV mutation status and shaped according to trisomy 12 mutation status. Samples with positive Factor 3 scores carry the trisomy 12 mutation, while those with negative Factor 3 scores do not.
+
+### Explore features 
+Feature data (e.g., mRNA) can be explored using scatter plots of factor scores versus expression values for the top features with the largest positive and negative weights. Samples are colored based on IGHV mutation status.
+```{r Feature, include=TRUE, message=FALSE, warning=FALSE}
+plot_data_scatter(MOFAobject, view = "mRNA",
+                  factor = 1, features = 4,
+                  sign = "positive", color_by = "IGHV") + 
+                  labs(y="RNA expression")
+# ESPNL, GLRA3, DPF3, ADAM29
+
+plot_data_scatter(MOFAobject, view = "mRNA",
+                  factor = 1, features = 4,
+                  sign = "negative", color_by = "IGHV" ) + 
+                  labs(y="RNA expression")
+# ZNF471, SEPTIN10, SOWAHC, ZNF667
+```
+
+A gene expression heatmap displaying the top 50 genes with the highest absolute weights on Factor 1
+```{r Featureheatmap, include=TRUE, message=FALSE, warning=FALSE}
+plot_data_heatmap(MOFAobject, view = "mRNA",
+                  factor = 1, features = 50,
+                  denoise = TRUE, cluster_rows = FALSE, 
+                  cluster_cols = FALSE, show_rownames = TRUE, 
+                  show_colnames = FALSE, scale = "row")
+```
+
+### Gene set enrichment
+Gene set enrichment analysis can be performed to identify significant associations between factors and gene sets.
+```{r gse, include=T, message=FALSE, warning=FALSE}
+utils::data(reactomeGS)
+# GSEA on positive weights
+res.positive <- run_enrichment(MOFAobject, feature.sets = reactomeGS, 
+                               view = "mRNA", sign = "positive" )
+
+# GSEA on negative weights
+res.negative <- run_enrichment(MOFAobject, feature.sets = reactomeGS, 
+                               view = "mRNA", sign = "negative" )
+
+plot_enrichment_heatmap(res.positive)
+plot_enrichment_heatmap(res.negative)
+plot_enrichment(res.positive, factor = 4, max.pathways = 15)
+plot_enrichment(res.negative, factor = 5, max.pathways = 15)
+```
+
+The enrichment heatmaps provide an overview of significant pathways associated with each factor. Factor 4 shows strong enrichment for genes with positive weights, while Factor 5 exhibits strong enrichment for genes with negative weights. This suggests that Factor 4 primarily captures variability in the immune response, whereas Factor 5 reflects variability in the stress response of blood cells.
+
+### Dimension reduction 
+```{r umap, include=T, message=FALSE, warning=FALSE}
+set.seed(123)
+
+# UMAP
+umap <- run_umap(MOFAobject)
+plot_dimred(umap, method='UMAP', color_by='IGHV', 
+            show_missing=FALSE, dot_siz=2.5)
+
+# T-SNE
+tsne <- run_tsne(MOFAobject)
+plot_dimred(tsne, method='TSNE', color_by='IGHV', 
+            show_missing=FALSE, dot_siz=2.5)
+```
+
+Samples are visualized on dimension reduction plots (UMAP and t-SNE) based on factor scores and colored according to IGHV mutation status.
+
+### Heatmap of factors
+A heatmap with two-way clustering of factor scores is presented, along with selected sample metadata for additional context.
+```{r heatmap, include=T, message=FALSE, warning=FALSE}
+colbar <- data.frame(IGHV=MOFAobject@samples_metadata$IGHV,
+                     trisomy12=MOFAobject@samples_metadata$trisomy12,
+                     treated=MOFAobject@samples_metadata$treatedAfter*1,
+                     died=MOFAobject@samples_metadata$died*1,
+                     gender=MOFAobject@samples_metadata$Gender)
+rownames(colbar) <- MOFAobject@samples_metadata$sample
+Z <- get_factors(MOFAobject)[[1]]
+Z.image <- Z
+Z.image[Z.image>3]=3
+Z.image[Z.image< -3]= -3
+pheatmap(t(Z.image), color=bluered(256), scale="none", 
+         cell_width=NA, cellheight=10, border_color=NA, 
+         cluster_rows = FALSE, show_rownames = TRUE, 
+         show_colnames = FALSE, cluster_cols = TRUE, 
+         clustering_distance_cols = "correlation", 
+         clustering_distance_rows = "correlation", 
+         clustering_method = "ward.D2", 
+         annotation_colors = NA, annotation_col = colbar, 
+         fontsize_row = 8, fontsize_col = 8, fontsize = 5)
+```
+
+
+### Survival analysis of factors 
+The factors can be linked to clinical outcomes (time to treatment) using the Cox model.
+```{r hr, include=T, message=FALSE, warning=FALSE}
+SurvObject <- Surv(MOFAobject@samples_metadata$TTT, MOFAobject@samples_metadata$treatedAfter)
+fit <- coxph(SurvObject ~ Z) 
+fit
+
+s <- summary(fit)
+coef <- s[["coefficients"]]
+
+df <- data.frame(factor = factor(rownames(coef), levels = rev(rownames(coef))),
+                 p = coef[,"Pr(>|z|)"], coef = coef[,"exp(coef)"], 
+                 lower = s[["conf.int"]][,"lower .95"], 
+                 higher = s[["conf.int"]][,"upper .95"])
+
+ggplot(df, aes(x=factor, y=coef, ymin=lower, ymax=higher)) +
+  geom_pointrange( col='#619CFF') + coord_flip() +
+  scale_x_discrete() + labs(y="Hazard Ratio", x="") + 
+  geom_hline(aes(yintercept=1), linetype="dotted") +
+  theme_bw()
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], Z1 = Z[,1])
+cut <- surv_cutpoint(df, variables='Z1')
+df$FactorCluster <- df$Z1 > cut$cutpoint$cutpoint
+fit <- survfit(Surv(time, event) ~ FactorCluster, df)
+
+ggsurvplot(fit, data = df, conf.int = TRUE, pval = TRUE, legend = "top", 
+           legend.labs = c(paste("Low Z1"), paste("High Z1")),
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Factor 1")$plot
+```
+
+Several factors are significantly associated with time to treatment. When samples are divided into two groups based on Factor 1, a significant difference in survival is observed between the groups.
+
+### Survival analysis of sample clusters
+Samples were clustered using K-means based on factor scores, and the resulting clusters were analyzed in relation to time to treatment by Kaplan-Meier curves. The survival curves show clear separation across different sample clusters.
+
+```{r km, include=T, message=FALSE, warning=FALSE}
+set.seed(123)
+clusters.MOFA <- cbind(K1=kmeans(Z,2)$cluster,
+                       K2=kmeans(Z,3)$cluster,
+                       K3=kmeans(Z,4)$cluster,
+                       K4=kmeans(Z,5)$cluster,
+                       K5=kmeans(Z,6)$cluster)
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.MOFA[,1])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Two Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.MOFA[,2])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Three Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.MOFA[,3])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Four Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.MOFA[,4])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Five Clusters")$plot
+```
+
+
+
+## Data integration using the R iClusterPlus package
+
+### Model overview
+The iCluster model takes multiple-omics data sets (A) to identify common latent variables that can be used to cluster patient samples in a lower dimensional integrated latent variable space (B). Simultaneously, driver omics features (e.g., gene expression, DNA methylation, and somatic mutation) that contribute to sample clustering are identified (C).
+
+```{r modeli, echo=FALSE, out.width="600"}
+knitr::include_graphics("icluster.png")
+```
+
+### Missing data imputation using MOFA2
+The R iClusterPlus package requires a complete dataset without missing values. Therefore, we imputed the missing data using MOFA2.
+```{r imputemofa, include=T, message=FALSE, warning=FALSE}
+MOFAobject <- impute(MOFAobject)
+imputed_data <- get_imputed_data(MOFAobject)
+CLL_imputed <- list(Drugs=t(imputed_data$Drugs$group1),
+                    Methylation=t(imputed_data$Methylation$group1),
+                    mRNA=t(imputed_data$mRNA$group1),
+                    Mutations=t(imputed_data$Mutations$group1))
+```
+
+### Run iClusterPlus
+iClusterPlus does not produce results using the imputed data from all four omics data types. Therefore, we use only the imputed methylation and mRNA data for iClusterPlus analysis.
+
+iClusterPlus fits a regularized latent variable model-based clustering approach, generating an integrated cluster assignment through joint inference across multiple data types. Below is a one-liner to run iClusterPlus, given the desired number of k (where the number of clusters is k+1) and a specified set of lambda parameter values. The optimal k and lambda must be determined through model tuning. If the number of clusters in the samples is known, we can directly choose the corresponding k (the number of latent variables) for cluster analysis. 
+If the cluster number is unknown, we can explore different values of k, testing from 1 to N (a reasonable range of clusters). In this example, we set k from 1 to 5. Note: This process may take several days to complete when running on a typical laptop.
+
+```{r runplus, include=T, message=FALSE, warning=FALSE}
+f <- file.path("./", "cv.fit.k1.Rdata")
+if (file.exists(f)) {
+  output2=alist()
+  files=grep("cv.fit",dir())
+  for(i in 1:length(files)) {
+    load(dir()[files[i]])
+    output2[[i]]=cv.fit
+  }
+} else {
+  set.seed(123)
+  for(k in 1:5) { 
+    print(k)
+    cv.fit = tune.iClusterPlus(cpus=1,dt1=CLL_imputed[[2]],dt2=CLL_imputed[[3]],
+                               type=c("gaussian","gaussian"), K=k, n.lambda=NULL,
+                               scale.lambda=c(1,1), maxiter=20)
+    save(cv.fit,file=paste("cv.fit.k",k,".Rdata",sep="")) 
+  }
+}
+
+nLambda = nrow(output2[[1]]$lambda)
+nK = length(output2)
+BIC = getBIC(output2)
+devR = getDevR(output2)
+minBICid = apply(BIC,2,which.min)
+devRatMinBIC = rep(NA,nK)
+for(i in 1:nK){
+  devRatMinBIC[i] = devR[minBICid[i],i]
+}
+```
+
+### Model selection
+For each k, we use the Bayesian Information Criterion (BIC) to identify the best sparse model with the optimal combination of penalty parameters. To determine the optimal k, we compute the deviance ratio. This deviance ratio can be interpreted as the percentage of explained variance. We select k where the percentage curve stabilizes, indicating the optimal number of clusters.
+```{r clusterplus, include=T, message=FALSE, warning=FALSE}
+clusters=getClusters(output2)
+rownames(clusters)=rownames(CLL_imputed[[2]])
+colnames(clusters)=paste("K=",2:(length(output2)+1),sep="") 
+plot(1:(nK+1),c(0,devRatMinBIC),type="b",xlab="Number of clusters (K+1)",
+     ylab="% Explained Variation")
+```
+
+For noisy data, the deviance ratio generally increases as k increases. In this case, we generated heatmaps of the datasets to visually assess clustering patterns. The optimal number of clusters should be chosen based on the observed structure and feature patterns in the heatmaps.
+
+
+### Heatmaps for different sample clusters
+Heatmap for two sample clusters:
+```{r heatmapplus1, include=T, message=FALSE, warning=FALSE}
+col.scheme=alist()
+col.scheme[[1]]=bluered(256)
+col.scheme[[2]]=bluered(256)
+meth.image=CLL_imputed[[2]]
+meth.image[meth.image>3]=3
+meth.image[meth.image< -3]= -3
+exp.image=scale(CLL_imputed[[3]])
+exp.image[exp.image>3]=3
+exp.image[exp.image< -3]= -3
+best.fit=output2[[1]]$fit[[which.min(BIC[,1])]]
+plotHeatmap(fit=best.fit, datasets=list(meth.image,exp.image),  
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,           
+            row.order=c(T,T),sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for three sample clusters:
+```{r heatmapplus2, include=T, message=FALSE, warning=FALSE}
+best.fit=output2[[2]]$fit[[which.min(BIC[,2])]]
+plotHeatmap(fit=best.fit, datasets=list(meth.image,exp.image),  
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,           
+            row.order=c(T,T),sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for four sample clusters:
+```{r heatmapplus3, include=T, message=FALSE, warning=FALSE}
+best.fit=output2[[3]]$fit[[which.min(BIC[,3])]]
+plotHeatmap(fit=best.fit, datasets=list(meth.image,exp.image),  
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,           
+             row.order=c(T,T),sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for five sample clusters:
+```{r heatmapplus4, include=T, message=FALSE, warning=FALSE}
+best.fit=output2[[4]]$fit[[which.min(BIC[,4])]]
+plotHeatmap(fit=best.fit, datasets=list(meth.image,exp.image),  
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,           
+            row.order=c(T,T),sparse=c(T,T),cap=c(T,T))
+```
+
+### Survival analysis of sample clusters
+The resulting clusters by iClusterPlus were analyzed in relation to time to treatment by Kaplan-Meier curves. The survival curves show clear separation across different sample clusters.
+```{r survplus, include=T, message=FALSE, warning=FALSE}
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters[,1])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Two Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters[,2])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Three Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters[,3])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Four Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters[,4])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Five Clusters")$plot
+```
+
+
+
+## Data integration using the iClusterBayes
+
+### Run iClusterBayes
+iClusterBayes is a Bayesian integrative clustering method (Mo et al., 2018). Unlike iClusterPlus, this method eliminates the need for a grid search to determine the optimal lasso parameter, significantly reducing computational requirements, especially for large datasets.
+```{r runbayes, include=T, message=FALSE, warning=FALSE}
+f <- "Bayfit.Rda"
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(123)
+  bayfit = tune.iClusterBayes(cpus=1,dt1=CLL_imputed[[2]],dt2=CLL_imputed[[3]],
+                              type=c("gaussian","gaussian"),K=1:6,
+                              n.burnin=18000, n.draw=12000,
+                              prior.gamma=c(0.5,0.5), sdev=0.05, thin=3)
+  save(bayfit,file=f) 
+}
+
+allBIC = NULL
+devratio = NULL
+nK = length(bayfit$fit)
+for(i in 1:nK){
+  allBIC = c(allBIC,bayfit$fit[[i]]$BIC)
+  devratio = c(devratio,bayfit$fit[[i]]$dev.ratio)
+}
+```
+
+### Model selection
+BIC or deviance ratio can be used as criteria to determine the optimal k, which defines the number of clusters. However, in noisy datasets, the deviance ratio may continue to increase, and the BIC may keep decreasing as k increases. In such cases, we suggest generating heatmaps of the datasets and selecting the optimal number of clusters based on the observed feature patterns.
+```{r clusterbayes, include=T, message=FALSE, warning=FALSE}
+clusters.Bayes <- cbind(K1=bayfit$fit[[1]]$clusters,
+                        K2=bayfit$fit[[2]]$clusters,
+                        K3=bayfit$fit[[3]]$clusters,
+                        K4=bayfit$fit[[4]]$clusters,
+                        K5=bayfit$fit[[5]]$clusters)
+rownames(clusters.Bayes)=rownames(CLL_imputed[[2]])
+par(mfrow=c(1,2))
+plot(1:nK, allBIC,type="b",xlab="k",ylab="BIC",pch=c(1,1,1,1,1,1))
+plot(1:nK,devratio,type="b",xlab="k",ylab="Deviance ratio",pch=c(1,1,1,1,1,1))
+par(mfrow=c(1,1))
+```
+
+### Posteriors of features
+The posterior probability of features can be used as a criterion for selecting features that drive the integrative clustering.
+
+Posteriors for two sample clusters:
+```{r postbayes1, include=T, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2))
+plot(bayfit$fit[[1]]$beta.pp[[1]],xlab="Genes",ylab="Posterior probability",
+     main="Methylation")
+plot(bayfit$fit[[1]]$beta.pp[[2]],xlab="Genes",ylab="Posterior probability",
+     main="Expression")
+par(mfrow=c(1,1))
+```
+
+Posteriors for three sample clusters:
+```{r postbayes2, include=T, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2))
+plot(bayfit$fit[[2]]$beta.pp[[1]],xlab="Genes",ylab="Posterior probability",
+     main="Methylation")
+plot(bayfit$fit[[2]]$beta.pp[[2]],xlab="Genes",ylab="Posterior probability",
+     main="Expression")
+par(mfrow=c(1,1))
+```
+
+Posteriors for four sample clusters:
+```{r postbayes3, include=T, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2))
+plot(bayfit$fit[[3]]$beta.pp[[1]],xlab="Genes",ylab="Posterior probability",
+     main="Methylation")
+plot(bayfit$fit[[3]]$beta.pp[[2]],xlab="Genes",ylab="Posterior probability",
+     main="Expression")
+par(mfrow=c(1,1))
+```
+
+Posteriors for five sample clusters:
+```{r postbayes4, include=T, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2))
+plot(bayfit$fit[[4]]$beta.pp[[1]],xlab="Genes",ylab="Posterior probability",
+     main="Methylation")
+plot(bayfit$fit[[4]]$beta.pp[[2]],xlab="Genes",ylab="Posterior probability",
+     main="Expression")
+par(mfrow=c(1,1))
+```
+
+### Heatmaps for different sample clusters
+Heatmap for two sample clusters:
+```{r heatmapbayes1, include=T, message=FALSE, warning=FALSE}
+col.scheme=alist()
+col.scheme[[1]]=bluered(256)
+col.scheme[[2]]=bluered(256)
+plotHMBayes(fit=bayfit$fit[[1]],datasets=list(meth.image,exp.image),
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,            
+            threshold=c(0.5,0.5),row.order=c(F,T),plot.chr=c(T,T),
+            sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for three sample clusters:
+```{r heatmapbayes2, include=T, message=FALSE, warning=FALSE}
+plotHMBayes(fit=bayfit$fit[[2]],datasets=list(meth.image,exp.image),
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,            
+            threshold=c(0.5,0.5),row.order=c(F,T),plot.chr=c(T,T),
+           sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for four sample clusters:
+```{r heatmapbayes3, include=T, message=FALSE, warning=FALSE}
+plotHMBayes(fit=bayfit$fit[[3]],datasets=list(meth.image,exp.image),
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,            
+            threshold=c(0.5,0.5),row.order=c(F,T),plot.chr=c(T,T),
+           sparse=c(T,T),cap=c(T,T))
+```
+
+Heatmap for five sample clusters:
+```{r heatmapbayes4, include=T, message=FALSE, warning=FALSE}
+plotHMBayes(fit=bayfit$fit[[4]],datasets=list(meth.image,exp.image),
+            type=c("gaussian","gaussian"), col.scheme = col.scheme,            
+            threshold=c(0.5,0.5),row.order=c(F,T),plot.chr=c(T,T),
+           sparse=c(T,T),cap=c(T,T))
+```
+
+
+### Survival analysis of sample clusters
+The resulting clusters by iClusterBayes were analyzed in relation to time to treatment by Kaplan-Meier curves. The survival curves show clear separation across different sample clusters.
+```{r survbayes, include=T, message=FALSE, warning=FALSE}
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.Bayes[,1])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Two Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.Bayes[,2])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Three Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.Bayes[,3])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Four Clusters")$plot
+
+df <- data.frame(time = SurvObject[,1], event = SurvObject[,2], cluster = clusters.Bayes[,4])
+fitSurvflt <- survfit(SurvObject ~ cluster, df)
+ggsurvplot(fitSurvflt, pval = TRUE, legend = "none",
+           xlab = "Time to treatment", ylab="Survival probability", 
+           title= "Five Clusters")$plot
+```
+
+
+## Comparison of the three methods
+Now, let's compare the sample clusters generated by the three methods. For two sample clusters, the methods produce similar results, indicating consistent clustering across approaches. However, for more than two sample clusters, the results become less consistent.
+
+### Matching of two sample clusters
+```{r comp2, include=T, message=FALSE, warning=FALSE}
+table(MOFA=clusters.MOFA[,1],iClusterPlus=clusters[,1])
+table(MOFA=clusters.MOFA[,1],iClusterBayes=clusters.Bayes[,1])
+table(iClusterPlus=clusters[,1],iClusterBayes=clusters.Bayes[,1])
+```
+
+### Matching of three sample clusters
+```{r comp3, include=T, message=FALSE, warning=FALSE}
+table(MOFA=clusters.MOFA[,2],iClusterPlus=clusters[,2])
+table(MOFA=clusters.MOFA[,2],iClusterBayes=clusters.Bayes[,2])
+table(iClusterPlus=clusters[,2],iClusterBayes=clusters.Bayes[,2])
+```
+
+### Matching of four sample clusters
+```{r comp4, include=T, message=FALSE, warning=FALSE}
+table(MOFA=clusters.MOFA[,3],iClusterPlus=clusters[,3])
+table(MOFA=clusters.MOFA[,3],iClusterBayes=clusters.Bayes[,3])
+table(iClusterPlus=clusters[,3],iClusterBayes=clusters.Bayes[,3])
+```
+
+### Matching of five sample clusters
+```{r comp5, include=T, message=FALSE, warning=FALSE}
+table(MOFA=clusters.MOFA[,4],iClusterPlus=clusters[,4])
+table(MOFA=clusters.MOFA[,4],iClusterBayes=clusters.Bayes[,4])
+table(iClusterPlus=clusters[,4],iClusterBayes=clusters.Bayes[,4])
+```
